@@ -1,0 +1,170 @@
+#! /bin/sh
+
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+CURL_ARGS=$@
+
+type jq >/dev/null 2>&1 || { echo >&2 "I require jq (http://stedolan.github.io/jq/) but it's not installed. Peacing Out."; exit 1; }
+
+BASEPATH="${HOME}/.curl_auth0"
+
+load_config_file() {
+	if [ -f "${CONFIGFILE}" ]
+	then
+		while read -r KEY VALUE
+		do
+			case "$KEY" in
+				"AUTH0_DOMAIN")
+					AUTH0_DOMAIN=$VALUE
+					;;
+				"AUTH0_CLIENTID")
+					AUTH0_CLIENTID=$VALUE
+					;;
+				"CURRENT_JWT")
+					CURRJWT=$VALUE
+					;;
+				"REFRESH_TOKEN")
+					RFRSHTK=$VALUE
+					;;
+			esac
+		done < "$CONFIGFILE"
+	fi
+}
+
+# POSIX compliant timestamp generator
+get_current_timestamp() {
+echo $((`TZ=GMT0 date +"((%Y-1600)*365+(%Y-1600)/4-(%Y-1600)/100+(%Y-1600)/400+%j-135140)*86400+%H*3600+%M*60+%S"`))
+}
+
+create_new_profile() {
+	printf "Please give this profile a name: "
+	read CURL_AUTH0_PROFILE
+	CONFIGFILE="${BASEPATH}/${CURL_AUTH0_PROFILE}"
+	printf "Auth0 Domain: "
+	read AUTH0_DOMAIN
+	printf "Auth0 Client ID: "
+	read AUTH0_CLIENTID
+	printf "Auth0 Connection Name: "
+	read AUTH0_CONNECTION
+	repair_refresh_token
+}
+
+repair_refresh_token() {
+	printf "Auth0 Username/email: "
+	read AUTH0_USERNAME
+	stty -echo
+	printf "Auth0 Password: "
+	read AUTH0_PASSWORD
+	stty echo
+	printf "\n"
+	AUTH0_SCOPE='openid email name user_id profile offline_access'
+	RO_URL=https://${AUTH0_DOMAIN}/oauth/ro
+	RO_PAYLOAD="{
+	   \"client_id\":   \"${AUTH0_CLIENTID}\",
+	   \"username\":    \"${AUTH0_USERNAME}\",
+	   \"password\":    \"${AUTH0_PASSWORD}\",
+	   \"connection\":  \"${AUTH0_CONNECTION}\",
+	   \"grant_type\":  \"password\",
+	   \"scope\":       \"${AUTH0_SCOPE}\",
+	   \"device\":      \"${AUTH0_USERNAME}-auth0-curl\"
+	}"
+	# must account for bad creds and such in here
+	RO_RESP=$(echo ${RO_PAYLOAD} | curl ${CURL_VERBOSE} -X POST --header 'Content-Type: application/json' --data-binary @- ${RO_URL})
+	RFRSHTK=$(echo ${RO_RESP} | jq -r '.refresh_token')
+	NEWJWT=$(echo ${RO_RESP} | jq -r '.id_token')
+	echo "AUTH0_DOMAIN ${AUTH0_DOMAIN}\nAUTH0_CLIENTID ${AUTH0_CLIENTID}\nAUTH0_CONNECTION ${AUTH0_CONNECTION}\nREFRESH_TOKEN ${RFRSHTK}\nCURRENT_JWT ${NEWJWT}" > "${CONFIGFILE}"
+}
+
+if [ ! -d "$BASEPATH" ]
+then
+	mkdir $BASEPATH
+fi
+
+if [ -z "$CURL_AUTH0_PROFILE" ]
+then
+	printf "No profile enabled. Please select or create a profile: (export CURL_AUTH0_PROFILE=profile-name-shown below\n"
+	printf "0) Create New Profile\n"
+	I=1
+	for f in $BASEPATH/*
+	do 
+		printf "$I) "
+		printf ${f##*/}
+		printf "\n"
+		I=$((I+1))
+	done
+	read PROFILE_SELECTION
+	if [ "$PROFILE_SELECTION" -eq 0 ]
+	then
+		create_new_profile
+	else
+		if [ "$PROFILE_SELECTION" -gt "$I" ] || [ "$PROFILE_SELECTION" -lt 0 ]
+		then
+			printf "Invalid Selection $I\n"
+			exit 1;
+		else
+			I=1
+			for f in $BASEPATH/*
+			do 
+				if [ "$I" -eq "$PROFILE_SELECTION" ]
+				then
+					CURL_AUTH0_PROFILE=${f##*/}
+				fi
+				I=$((I+1))
+			done
+		fi
+	fi
+fi
+
+CONFIGFILE="${BASEPATH}/${CURL_AUTH0_PROFILE}"
+VALIDJWT=true
+VALID_REFRESH_TOKEN=true
+
+if [ -f "${CONFIGFILE}" ]
+then
+	load_config_file
+	IFS="\." read -r JWTCODE JWTBODY JWTSIGN <<EOF
+		$CURRJWT
+EOF
+	#Check refresh token validity.
+	# REFRESH_TOKEN BPoBbZPWH8HNXqU73mgOKuV1v62gxZ5WGtNsdnsAM6ZbB
+	if ! [ -n "$RFRSHTK" ] || ! [ ${#RFRSHTK} -eq 45 ]
+	then
+		printf "Refresh Token appears invalid. Requesting new..."
+		repair_refresh_token
+	fi
+
+	# Check JWT validity
+	EXIPIRA=$(echo $JWTBODY | base64 -d 2>/dev/null | jq '.exp' | cut -b1-10)
+	# Current token is expired, please refresh it
+	if [ "$(get_current_timestamp)" -gt "$EXIPIRA" ] || ! $(printf '%s' "$EXIPIRA" | grep --extended-regexp --quiet --regexp=[0-9]{10})
+	then
+		REFRESH_URL=https://${AUTH0_DOMAIN}/delegation
+		REFRESH_PAYLOAD="{
+		   \"client_id\":   \"${AUTH0_CLIENTID}\",
+		   \"grant_type\":  \"urn:ietf:params:oauth:grant-type:jwt-bearer\",
+		   \"refresh_token\":  \"${RFRSHTK}\",
+		   \"api_type\":  \"app\"
+		}"
+		REFRESH_RESP=$(echo ${REFRESH_PAYLOAD} | curl ${CURL_VERBOSE} -X POST --header 'Content-Type: application/json' --data-binary @- ${REFRESH_URL})
+		NEWJWT=$(echo ${REFRESH_RESP} | jq -r '.id_token')
+		if [ "$NEWJWT" = "null" ]
+		then
+			printf "I am sorry, the JWT was not able to be rereshed, would you like to reset this profile...(feature coming soon)"
+		else
+			echo "AUTH0_DOMAIN ${AUTH0_DOMAIN}\nAUTH0_CLIENTID ${AUTH0_CLIENTID}\nAUTH0_CONNECTION ${AUTH0_CONNECTION}\nREFRESH_TOKEN ${RFRSHTK}\nCURRENT_JWT ${NEWJWT}" > "${CONFIGFILE}"
+			load_config_file
+		fi
+	fi
+fi
+
+curl --header "Authorization: Bearer ${CURRJWT}" ${CURL_VERBOSE} ${CURL_ARGS} | jq .
