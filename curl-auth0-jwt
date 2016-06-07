@@ -30,6 +30,9 @@ load_config_file() {
 				"AUTH0_CLIENTID")
 					AUTH0_CLIENTID=$VALUE
 					;;
+				"AUTH0_CONNECTION")
+					AUTH0_CONNECTION=$VALUE
+					;;
 				"CURRENT_JWT")
 					CURRJWT=$VALUE
 					;;
